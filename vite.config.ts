@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+const apiTarget = process.env.TONECAPTION_API_TARGET || 'http://127.0.0.1:8000'
+
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -8,7 +10,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: apiTarget,
         changeOrigin: true,
       },
     },
@@ -18,7 +20,7 @@ export default defineConfig({
     port: 4173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: apiTarget,
         changeOrigin: true,
       },
     },

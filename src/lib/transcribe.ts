@@ -1,5 +1,7 @@
 import type { TranscribeResult } from '../types'
 
+const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/+$/, '')
+
 export const EMOTION_LABEL: Record<string, string> = {
   neutral: '中性',
   happy: '高兴',
@@ -38,11 +40,13 @@ export async function transcribeFile(
   form.append('file', file)
   let res: Response
   try {
-    res = await fetch('/api/transcribe', { method: 'POST', body: form, signal })
+    res = await fetch(`${API_BASE}/api/transcribe`, { method: 'POST', body: form, signal })
   } catch (err) {
     if (signal?.aborted) throw err
     throw new Error(
-      '无法连接后端服务。请先在 backend 目录启动：uvicorn app:app --host 0.0.0.0 --port 8000',
+      API_BASE
+        ? `无法连接识别服务（${API_BASE}）。请检查网络后重试。`
+        : '无法连接后端服务。请先在 backend 目录启动：uvicorn app:app --host 0.0.0.0 --port 8000',
     )
   }
   if (!res.ok) {
@@ -56,7 +60,9 @@ export async function transcribeFile(
     if (detail) throw new Error(detail)
     if (res.status >= 500) {
       throw new Error(
-        `无法连接后端服务（HTTP ${res.status}，后端可能未启动）。请在 backend 目录运行：uvicorn app:app --host 0.0.0.0 --port 8000`,
+        API_BASE
+          ? `识别服务暂时不可用（HTTP ${res.status}），请稍后重试。`
+          : `无法连接后端服务（HTTP ${res.status}，后端可能未启动）。请在 backend 目录运行：uvicorn app:app --host 0.0.0.0 --port 8000`,
       )
     }
     if (res.status === 404 || res.status === 405 || res.status === 501) {
@@ -72,7 +78,7 @@ export async function transcribeFile(
 /** 探测本地识别服务是否可用；线上静态站会返回 404/HTML，视为不可用。 */
 export async function checkTranscribeService(): Promise<boolean> {
   try {
-    const res = await fetch('/api/health')
+    const res = await fetch(`${API_BASE}/api/health`)
     if (!res.ok) return false
     const body = await res.json()
     return body?.status === 'ok'
