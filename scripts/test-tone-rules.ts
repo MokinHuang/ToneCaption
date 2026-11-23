@@ -6,6 +6,7 @@ import {
   hasQuestionCue,
   findPrevQuestion,
   isShortEchoClause,
+  splitSentences,
 } from '../src/lib/toneRules.ts'
 
 const hit = (text: string) => {
@@ -21,7 +22,7 @@ const none = (text: string) => {
   assert.equal(m.hit, false, `不应命中: ${text}（${m.pattern}）`)
   return m
 }
-const suppressed = (text: string, by: 'quoted' | 'reported-speech') => {
+const suppressed = (text: string, by: 'quoted' | 'reported-speech' | 'embedded-question' | 'rhetorical' | 'action-request') => {
   const m = matchTextTone(text)
   assert.equal(m.hit, false, `应被抑制: ${text}`)
   assert.equal(m.suppressedBy, by)
@@ -152,4 +153,88 @@ test('所有命中用例摘录均为原词子串（批量）', () => {
     '这样行不',
   ]
   for (const t of texts) hit(t)
+})
+
+test('本轮收紧：确认问句凭原词命中，有无问号均可', () => {
+  const m = hit('改到周一，大家能接受吗')
+  assert.equal(m.excerpt, '大家能接受吗')
+  const m2 = hit('改到周一，大家能接受吗？')
+  assert.equal(m2.excerpt, '大家能接受吗')
+})
+
+test('本轮收紧：反问不提示', () => {
+  suppressed('难道这还不明显吗', 'rhetorical')
+  suppressed('这还不明显吗', 'rhetorical')
+  suppressed('难道大家都不懂吗', 'rhetorical')
+  suppressed('这岂不是白做了吗', 'rhetorical')
+  // 弱标记不误伤「吧」求证
+  hit('时间还不晚吧')
+})
+
+test('本轮收紧：动作请求不提示', () => {
+  suppressed('能不能把窗户关一下', 'action-request')
+  suppressed('能不能帮我拿一下粉笔', 'action-request')
+  suppressed('可不可以把声音放大一下', 'action-request')
+  // 真求证不受影响
+  hit('能不能提前交？')
+  hit('可不可以用计算器')
+})
+
+test('本轮收紧：第一人称嵌入式疑问不提示', () => {
+  suppressed('我昨天问过能不能补交', 'embedded-question')
+  suppressed('我也不知道这周五能不能交', 'embedded-question')
+  suppressed('我们还没想好要不要补课', 'embedded-question')
+  // 第一人称直接求证仍命中
+  hit('我说这样行不行')
+  hit('大家说说这样好不好')
+})
+
+test('本轮收紧：转述作用范围按命中小句判定', () => {
+  // 前句是转述框架但命中在后半句独立问句 → 提示，摘录来自后半句
+  const m = hit('老师说周五交，你们能接受吗')
+  assert.equal(m.excerpt, '你们能接受吗')
+  // 前句以转述动词收尾（无引号 ASR）→ 后句属被转述内容
+  suppressed('他问我，能不能补交', 'reported-speech')
+  suppressed('老师问大家，这样行不行', 'reported-speech')
+  suppressed('我问过，能不能补交', 'reported-speech')
+  // 第一人称现在时直接发问不抑制
+  hit('我问能不能提前交')
+})
+test('splitSentences：问号划界、范围绑定、末尾残句标记', () => {
+  const spans = splitSentences('大家能接受吗？有冲突的下课来找我。')
+  assert.equal(spans.length, 2)
+  assert.deepEqual(
+    spans.map((s) => [s.text, s.start, s.end, s.complete]),
+    [
+      ['大家能接受吗？', 0, 7, true],
+      ['有冲突的下课来找我。', 7, 17, true],
+    ],
+  )
+  const frag = splitSentences('大家能接受吗？有冲突的')
+  assert.equal(frag.length, 2)
+  assert.equal(frag[0].complete, true)
+  assert.equal(frag[1].complete, false)
+  assert.equal(splitSentences('这周五交')[0].complete, false)
+  assert.deepEqual(splitSentences(''), [])
+  assert.deepEqual(splitSentences('   '), [])
+})
+
+test('splitSentences：引号内不切、连续终止符与闭引号归前句', () => {
+  const quoted = splitSentences('他念了一句「大家能接受吗？」然后笑了。')
+  assert.equal(quoted.length, 1)
+  assert.equal(quoted[0].complete, true)
+  const multi = splitSentences('真的吗？！好吧。')
+  assert.equal(multi.length, 2)
+  assert.equal(multi[0].text, '真的吗？！')
+  const curly = splitSentences('他说“行吗？”好。')
+  assert.equal(curly.length, 1)
+})
+
+test('matchTextTone：跨句转述上下文（prevContext）', () => {
+  const m = matchTextTone('能不能补交', '他问我。')
+  assert.equal(m.hit, false)
+  assert.equal(m.suppressedBy, 'reported-speech')
+  const m2 = matchTextTone('你们能接受吗', '老师说周五交。')
+  assert.equal(m2.hit, true)
+  assert.equal(m2.excerpt, '你们能接受吗')
 })

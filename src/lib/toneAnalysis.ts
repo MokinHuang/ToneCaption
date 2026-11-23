@@ -1,8 +1,9 @@
 /** 语气融合：文本规则 + 句末音高 + 少量上文 → 三态输出（语气 / 仅线索 / 只留字幕）。
  *  整体 try/catch，任何异常都降级为"只留字幕"，绝不影响收音与转写。
  *  SenseVoice 声学情感仅作记录，不参与判断；说话人不明，不做跨句音量/语速比较。 */
-import type { ToneAnalysisDetail } from '../types.ts'
-import { matchTextTone, findPrevQuestion, isShortEchoClause } from './toneRules.ts'
+import type { SentenceTone, ToneAnalysisDetail } from '../types.ts'
+import { matchTextTone, findPrevQuestion, splitSentences } from './toneRules.ts'
+import type { ToneSuppression, TextToneMatch } from './toneRules.ts'
 import { pitchTrack, tailRise, voicedEndMs, PITCH_CONST } from './pitch.ts'
 import type { TailRiseResult } from './pitch.ts'
 
@@ -25,6 +26,8 @@ export interface ToneAnalysisOutput {
   evidence?: string
   toneCue?: string
   detail: ToneAnalysisDetail
+  /** 段内逐句结果（含单句段）；多句时提示按句子位置/原文范围绑定 */
+  sentences: SentenceTone[]
 }
 
 const PITCH_REASON_ZH: Record<string, string> = {
@@ -45,6 +48,8 @@ const PITCH_REASON_ZH: Record<string, string> = {
   'budget-exceeded': '分析超时，放弃音高',
   'empty-text': '该段未识别出文字',
   'analysis-error': '分析异常',
+  'incomplete-sentence': '句尾边界不完整，暂缓判断',
+  'not-aligned': '音高测量未对齐到本句',
 }
 
 export function pitchReasonLabel(reason: string | null): string {
@@ -52,12 +57,16 @@ export function pitchReasonLabel(reason: string | null): string {
   return PITCH_REASON_ZH[reason] ?? reason
 }
 
-async function measurePitch(
-  pcm: Float32Array | null,
-  cutReason: ToneAnalysisInput['cutReason'],
-): Promise<TailRiseResult> {
+const SUPPRESS_REASON: Record<ToneSuppression, string> = {
+  quoted: '确认类措辞在引号内，属引用，不提示回应',
+  'reported-speech': '转述他人或自己过去的话语，不提示全班回应',
+  'embedded-question': '疑问嵌在「不知道/问过」等表述里，不是向听众求证',
+  rhetorical: '反问句，不期待回应',
+  'action-request': '动作请求（把/帮/一下类），不是征求确认',
+}
+
+async function measurePitch(pcm: Float32Array | null): Promise<TailRiseResult> {
   if (!pcm || pcm.length === 0) return { ok: false, reason: 'no-audio' }
-  if (cutReason === 'max-length') return { ok: false, reason: 'forced-cut' }
   const sr = 16000
   const totalMs = (pcm.length / sr) * 1000
   if (totalMs < MIN_PITCH_SEGMENT_MS) return { ok: false, reason: 'too-short-segment' }
@@ -80,8 +89,34 @@ async function measurePitch(
   return tailRise(body, tail)
 }
 
+/** 单句判定：文本命中→语气；被抑制→只留字幕；仅实测上扬→线索。 */
+function conclude(
+  tr: TextToneMatch,
+  pr: TailRiseResult | null,
+  detail: ToneAnalysisDetail,
+): { tone?: string; evidence?: string; toneCue?: string } {
+  if (tr.hit) {
+    detail.conclusion = 'tone'
+    detail.reason = `文本命中：${tr.pattern}`
+    const evidence = `说了「${tr.excerpt}」${pr?.ok ? '，句末音高上扬' : ''}`
+    return { tone: TONE_LABEL, evidence }
+  }
+  if (tr.suppressedBy) {
+    detail.reason = SUPPRESS_REASON[tr.suppressedBy]
+    return {}
+  }
+  // 上文提问 + 简短回答最多支持「句末音高上扬」线索：回答本身不是征求确认
+  if (pr?.ok) {
+    detail.conclusion = 'cue-only'
+    detail.reason = '无确认类措辞，仅实测到句末上扬，保留线索不猜语气'
+    return { toneCue: CUE_LABEL }
+  }
+  detail.reason = `无确认类措辞；音高：${pitchReasonLabel(detail.pitchNullReason)}`
+  return {}
+}
+
 export async function analyzeSegmentTone(input: ToneAnalysisInput): Promise<ToneAnalysisOutput> {
-  const detail: ToneAnalysisDetail = {
+  const baseDetail = (): ToneAnalysisDetail => ({
     textPattern: null,
     textExcerpt: null,
     suppressedBy: null,
@@ -91,59 +126,78 @@ export async function analyzeSegmentTone(input: ToneAnalysisInput): Promise<Tone
     contextPrevQuestion: null,
     conclusion: 'none',
     reason: '',
-  }
+  })
   try {
     const text = input.text ?? ''
-    if (!text.trim()) {
+    const spans = splitSentences(text)
+    if (spans.length === 0) {
+      const detail = baseDetail()
       detail.pitchNullReason = 'empty-text'
       detail.reason = PITCH_REASON_ZH['empty-text']
-      return { detail }
+      return { detail, sentences: [] }
     }
-    const tr = matchTextTone(text)
-    detail.textPattern = tr.pattern
-    detail.textExcerpt = tr.excerpt
-    detail.suppressedBy = tr.suppressedBy
+    const multi = spans.length > 1
+    const forced = input.cutReason === 'max-length'
 
-    const pr = await measurePitch(input.pcm16k, input.cutReason)
-    detail.pitch = pr.ok ? pr.m : null
-    detail.pitchNullReason = pr.ok ? null : pr.reason
+    // 单句 + 强制切段：切点不是语句末尾，整体暂缓（文本线索仍记录）
+    if (!multi && forced) {
+      const detail = baseDetail()
+      const tr = matchTextTone(text)
+      detail.textPattern = tr.pattern
+      detail.textExcerpt = tr.excerpt
+      detail.suppressedBy = tr.suppressedBy
+      detail.pitchNullReason = 'forced-cut'
+      detail.reason = '超长强制分段，末尾小句可能未说完，暂缓语气判断'
+      return { detail, sentences: [{ ...spans[0], detail }] }
+    }
 
+    // 音高整段测一次，只能对齐到"段末完整句"：自然切段且末尾无未完成残句。
+    // 多句段的前句无法从句级时间戳对齐音高，一律不列为其依据。
+    const last = spans[spans.length - 1]
+    const pitchEligible = !forced && (!multi || last.complete)
+    const pr = pitchEligible ? await measurePitch(input.pcm16k) : null
     const ctx = findPrevQuestion(input.prevTexts)
-    detail.contextPrevQuestion = ctx
 
-    if (tr.hit) {
-      detail.conclusion = 'tone'
-      detail.reason = `文本命中：${tr.pattern}`
-      const evidence = `说了「${tr.excerpt}」${pr.ok ? '，句末音高上扬' : ''}`
-      return { tone: TONE_LABEL, evidence, detail }
-    }
-    if (tr.suppressedBy) {
-      detail.reason =
-        tr.suppressedBy === 'quoted'
-          ? '确认类措辞在引号内，属引用，不提示回应'
-          : '转述他人话语，不提示全班回应'
-      return { detail }
-    }
-    if (ctx && isShortEchoClause(text) && pr.ok) {
-      detail.conclusion = 'tone'
-      detail.reason = '承接前句提问，且实测句末上扬'
-      return {
-        tone: TONE_LABEL,
-        evidence: `承接前句提问「${ctx}」，句末音高上扬`,
-        detail,
+    const sentences: SentenceTone[] = []
+    for (let i = 0; i < spans.length; i++) {
+      const sp = spans[i]
+      const detail = baseDetail()
+      detail.contextPrevQuestion = ctx
+      // 多句段的末尾残句（含强制切段后的未完成句）：先显示字幕，暂缓判断
+      if (multi && !sp.complete) {
+        detail.pitchNullReason = forced ? 'forced-cut' : 'incomplete-sentence'
+        detail.reason = forced
+          ? '强制切段后的未完成句，暂缓语气判断'
+          : '句尾边界不完整，暂缓语气判断'
+        sentences.push({ ...sp, detail })
+        continue
       }
+      const tr = matchTextTone(sp.text, i > 0 ? spans[i - 1].text : '')
+      detail.textPattern = tr.pattern
+      detail.textExcerpt = tr.excerpt
+      detail.suppressedBy = tr.suppressedBy
+      const attributed = i === spans.length - 1 ? pr : null
+      if (attributed) {
+        detail.pitch = attributed.ok ? attributed.m : null
+        detail.pitchNullReason = attributed.ok ? null : attributed.reason
+      } else {
+        detail.pitchNullReason = forced ? 'forced-cut' : 'not-aligned'
+      }
+      sentences.push({ ...sp, ...conclude(tr, attributed, detail), detail })
     }
-    if (pr.ok) {
-      detail.conclusion = 'cue-only'
-      detail.reason = '无确认类措辞，仅实测到句末上扬，保留线索不猜语气'
-      return { toneCue: CUE_LABEL, detail }
+    const winner = sentences.find((s) => s.tone) ?? sentences.find((s) => s.toneCue)
+    return {
+      tone: winner?.tone,
+      evidence: winner?.evidence,
+      toneCue: winner?.toneCue,
+      detail: winner?.detail ?? sentences[sentences.length - 1].detail,
+      sentences,
     }
-    detail.reason = `无确认类措辞；音高：${pitchReasonLabel(detail.pitchNullReason)}`
-    return { detail }
   } catch (err) {
+    const detail = baseDetail()
     detail.conclusion = 'none'
     detail.pitchNullReason = 'analysis-error'
     detail.reason = `分析异常：${err instanceof Error ? err.message : String(err)}`
-    return { detail }
+    return { detail, sentences: [] }
   }
 }

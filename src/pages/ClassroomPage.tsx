@@ -10,7 +10,7 @@ import type {
 } from '../types'
 import { checkTranscribeService, emotionLabel, eventLabel, transcribeFile } from '../lib/transcribe'
 import { pitchReasonLabel } from '../lib/toneAnalysis.ts'
-import { MicLiveSession } from '../lib/liveMic'
+import { MicLiveSession, isPunctuationOnly } from '../lib/liveMic'
 
 interface ClassroomPageProps {
   session: ClassroomSession
@@ -18,6 +18,14 @@ interface ClassroomPageProps {
 }
 
 const FONT_SIZES = [16, 18, 20, 22, 24, 26, 28]
+
+const SUPPRESS_LABEL: Record<string, string> = {
+  quoted: '引号内',
+  'reported-speech': '转述',
+  'embedded-question': '嵌入式疑问',
+  rhetorical: '反问',
+  'action-request': '动作请求',
+}
 const DEFAULT_FONT_INDEX = 2
 
 type RecState =
@@ -42,15 +50,27 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
   const listRef = useRef<HTMLOListElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  const liveCaptionSegs: CaptionSegment[] = liveSegs.map((s) => ({
-    id: `live-${s.seq}`,
-    text: s.text,
-    pending: s.status === 'pending',
-    error: s.error,
-    tone: s.tone,
-    evidence: s.evidence,
-    cue: s.toneCue,
-  }))
+  const liveCaptionSegs: CaptionSegment[] = liveSegs.map((s) => {
+    const parts =
+      s.toneSentences && s.toneSentences.length > 1
+        ? s.toneSentences.map((p) => ({
+            text: p.text,
+            tone: p.tone,
+            evidence: p.evidence,
+            cue: p.toneCue,
+          }))
+        : undefined
+    return {
+      id: `live-${s.seq}`,
+      text: s.text,
+      pending: s.status === 'pending',
+      error: s.error,
+      tone: parts ? undefined : s.tone,
+      evidence: parts ? undefined : s.evidence,
+      cue: parts ? undefined : s.toneCue,
+      parts,
+    }
+  })
   const lastDone = [...liveSegs].reverse().find((s) => s.status === 'done')
   const liveCurrentId = lastDone ? `live-${lastDone.seq}` : undefined
   const doneWithMetrics = liveSegs.filter((s) => s.status === 'done' && s.metrics)
@@ -160,7 +180,9 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
   const fontSize = FONT_SIZES[fontIndex]
   const recSegments: CaptionSegment[] =
     rec.status === 'success'
-      ? rec.result.segments.map((s, i) => ({ id: `r${i + 1}`, text: s.text }))
+      ? rec.result.segments
+          .filter((s) => !isPunctuationOnly(s.text))
+          .map((s, i) => ({ id: `r${i + 1}`, text: s.text }))
       : []
   const recCurrentId = recSegments.length
     ? recSegments[recSegments.length - 1].id
@@ -291,14 +313,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
               )}
               {service === 'unavailable' && (
                 <div className="service-notice" role="alert">
-                  <p>
-                    未连接到识别服务，无法开始收音。线上演示站是静态页面，不含后端；请在本地启动：
-                  </p>
-                  <code>npm run dev</code>
-                  <code>
-                    cd backend; ..\.venv\Scripts\python.exe -m uvicorn app:app
-                    --host 0.0.0.0 --port 8000
-                  </code>
+                  <p>识别服务暂时无法连接，无法开始收音。请稍后重试。</p>
                   <button
                     type="button"
                     className="btn-recheck"
@@ -414,7 +429,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
                               <td>{s.seq}</td>
                               <td>
                                 {d.suppressedBy
-                                  ? `${d.suppressedBy === 'quoted' ? '引号内' : '转述'}（已抑制）`
+                                  ? `${SUPPRESS_LABEL[d.suppressedBy] ?? d.suppressedBy}（已抑制）`
                                   : d.textPattern
                                     ? `${d.textPattern}「${d.textExcerpt}」`
                                     : '无命中'}
@@ -463,14 +478,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
               )}
               {service === 'unavailable' && (
                 <div className="service-notice" role="alert">
-                  <p>
-                    未连接到识别服务。线上演示站是静态页面，不含后端；识别自己的录音请在本地启动：
-                  </p>
-                  <code>npm run dev</code>
-                  <code>
-                    cd backend; ..\.venv\Scripts\python.exe -m uvicorn app:app
-                    --host 0.0.0.0 --port 8000
-                  </code>
+                  <p>识别服务暂时无法连接，无法识别录音。请稍后重试。</p>
                   <button
                     type="button"
                     className="btn-recheck"
@@ -627,9 +635,9 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
         </button>
         <p className="action-note">
           {view === 'live'
-            ? '真实识别结果 · 语气提示为本地规则推断 · 音频仅发送到本地后端 · 停止即释放麦克风'
+            ? '真实识别结果 · 语气提示为本地规则推断 · 音频仅发送到识别服务 · 停止即释放麦克风'
             : view === 'recording'
-              ? '上传 WAV 由本地 SenseVoiceSmall 识别，失败给出具体原因'
+              ? '上传 WAV 由 SenseVoiceSmall 识别，失败给出具体原因'
               : '示例数据 · 不采集声音'}
         </p>
       </footer>

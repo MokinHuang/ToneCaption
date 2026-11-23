@@ -2,13 +2,20 @@
  *  纯函数、零依赖、仅可擦除 TS 语法，node:test 可直跑。
  *  自动标点（问号）绝不单独触发任何判断。 */
 
+export type ToneSuppression =
+  | 'quoted'
+  | 'reported-speech'
+  | 'embedded-question'
+  | 'rhetorical'
+  | 'action-request'
+
 export interface TextToneMatch {
   hit: boolean
   /** 命中模式名（人类可读，进详情） */
   pattern: string | null
   /** 转写原词摘录，保证是 text 的子串 */
   excerpt: string | null
-  suppressedBy: 'quoted' | 'reported-speech' | null
+  suppressedBy: ToneSuppression | null
 }
 
 const TRAILING_PUNCT = /[”」』’"？?。.!！…~\s]+$/
@@ -28,6 +35,27 @@ const LE_MEIYOU = /了没有$/
 /** 转述框架：第三人称主语 +（间隔 ≤4 字）+ 问/说类动词。第一人称不抑制。 */
 const REPORTED_SPEECH =
   /(他们|她们|他|她|老师|同学们|同学|有人|某人|[\u4e00-\u9fa5]{1,2}同学|[\u4e00-\u9fa5]{1,2}老师)[^，。]{0,4}?(问|说|问道|想知道|提到)/
+
+/** 反问强标记：任何确认模式命中都抑制。 */
+const RHETORICAL_STRONG = /(难道|岂|何必|何苦)/
+/** 反问弱标记：仅「吗」命中时抑制，避免误伤"时间还不晚吧"类求证。 */
+const RHETORICAL_SOFT = /(还不是|还不|不就|不都|这不是|那不是)/
+
+/** 动作请求：命中词之后出现处置/使役标记，或小句以「一下」收尾。 */
+const REQUEST_AFTER = /(把|帮|替|给|让)/
+const REQUEST_TAIL = /一下$/
+
+/** 第一人称嵌入式疑问：命中词之前有"我(们)+认知/过去言说动词"，疑问不指向听众。
+ *  裸「说/问」不在此列——"我说这样行不行"仍是向听众求证。 */
+const FIRST_PERSON_EMBEDDED =
+  /(我|我们|咱|咱们)[^，。]{0,8}?(不知道|不清楚|不确定|没想好|没想过|问过|问了|说过|考虑过|琢磨|怀疑|担心|犹豫)/
+
+/** 跨小句转述：前一末尾小句以转述框架收尾（动词在句末，可带宾语代词），
+ *  则当前小句是被转述的内容。"老师说周五交，你们能接受吗"前句以「交」收尾，不在此列。 */
+const REPORT_TAIL_THIRD =
+  /(他们|她们|他|她|老师|同学们|同学|有人|某人|[\u4e00-\u9fa5]{1,2}同学|[\u4e00-\u9fa5]{1,2}老师)[^，。]{0,6}?(问|说|问道|想知道|提到)(我|我们|大家|你们|他|她|他们|她们)?$/
+const REPORT_TAIL_FIRST =
+  /(我|我们|咱|咱们)[^，。]{0,6}?(问过|问了|说过|不知道|不清楚|不确定)$/
 
 const QUOTE_PAIRS: [string, string][] = [
   ['“', '”'],
@@ -52,6 +80,49 @@ export function lastClause(text: string): { clause: string; start: number } {
   return { clause: stripped.slice(cut + 1), start: cut + 1 }
 }
 
+const SENTENCE_END = /[。？！?!…]/
+const CLOSING_QUOTE = /[”」』’"]/
+const LEADING_WS = /^\s+/
+
+export interface SentenceSpan {
+  text: string
+  start: number
+  end: number
+  /** 以句末终止符收尾；末尾无终止符的残句为 false */
+  complete: boolean
+}
+
+/** 按句末终止符划分句子（引号内不切，终止符后的闭引号归前句）。
+ *  问号只用于划界，不作为语气证据。末尾无终止符的片段标记为未完成。 */
+export function splitSentences(text: string): SentenceSpan[] {
+  if (!text.trim()) return []
+  const quotes = quotedRanges(text)
+  const inQuote = (i: number) => quotes.some(([a, b]) => i >= a && i < b)
+  const out: SentenceSpan[] = []
+  const push = (from: number, to: number, complete: boolean) => {
+    const lead = text.slice(from, to).match(LEADING_WS)?.[0].length ?? 0
+    const start = from + lead
+    const end = to
+    if (start >= end || !text.slice(start, end).trim()) return
+    out.push({ text: text.slice(start, end), start, end, complete })
+  }
+  let start = 0
+  let i = 0
+  while (i < text.length) {
+    if (SENTENCE_END.test(text[i]) && !inQuote(i)) {
+      let j = i + 1
+      while (j < text.length && (SENTENCE_END.test(text[j]) || CLOSING_QUOTE.test(text[j]))) j++
+      push(start, j, true)
+      start = j
+      i = j
+    } else {
+      i++
+    }
+  }
+  if (start < text.length) push(start, text.length, false)
+  return out
+}
+
 function quotedRanges(text: string): [number, number][] {
   const ranges: [number, number][] = []
   for (const [open, close] of QUOTE_PAIRS) {
@@ -71,25 +142,27 @@ function quotedRanges(text: string): [number, number][] {
 interface PatternHit {
   name: string
   index: number
+  len: number
+  kind: 'ma' | 'ba' | 'a-not-a'
 }
 
 function matchClause(clause: string): PatternHit | null {
   if (/吗$/.test(clause)) {
-    return { name: '句尾疑问词「吗」', index: clause.length - 1 }
+    return { name: '句尾疑问词「吗」', index: clause.length - 1, len: 1, kind: 'ma' }
   }
   if (/吧$/.test(clause)) {
     if (IMPERATIVE_BA.test(clause) || BARE_AGREEMENT_BA.test(clause)) return null
     if (/了吧$/.test(clause) && !ACHIEVEMENT_LE_BA.test(clause)) return null
-    return { name: '句尾求证词「吧」', index: clause.length - 1 }
+    return { name: '句尾求证词「吧」', index: clause.length - 1, len: 1, kind: 'ba' }
   }
   const le = LE_MEIYOU.exec(clause)
-  if (le) return { name: '完成体正反问「了没有」', index: le.index }
+  if (le) return { name: '完成体正反问「了没有」', index: le.index, len: le[0].length, kind: 'a-not-a' }
   const en = A_NOT_A.exec(clause)
-  if (en) return { name: `正反问「${en[0]}」`, index: en.index }
+  if (en) return { name: `正反问「${en[0]}」`, index: en.index, len: en[0].length, kind: 'a-not-a' }
   const ge = A_NOT_A_GENERIC.exec(clause)
-  if (ge) return { name: `正反问「${ge[0]}」`, index: ge.index }
+  if (ge) return { name: `正反问「${ge[0]}」`, index: ge.index, len: ge[0].length, kind: 'a-not-a' }
   const ta = A_NOT_A_TAIL.exec(clause)
-  if (ta) return { name: `句尾正反问「${ta[0]}」`, index: ta.index }
+  if (ta) return { name: `句尾正反问「${ta[0]}」`, index: ta.index, len: ta[0].length, kind: 'a-not-a' }
   return null
 }
 
@@ -99,7 +172,8 @@ function makeExcerpt(text: string, clauseStart: number, clauseEnd: number, match
   return text.slice(start, clauseEnd)
 }
 
-export function matchTextTone(text: string): TextToneMatch {
+/** prevContext：同段内前一句原文，用于跨句转述判定（本句内部无前句时回退）。 */
+export function matchTextTone(text: string, prevContext = ''): TextToneMatch {
   const none: TextToneMatch = { hit: false, pattern: null, excerpt: null, suppressedBy: null }
   if (!text.trim()) return none
   const { clause, start } = lastClause(text)
@@ -107,15 +181,37 @@ export function matchTextTone(text: string): TextToneMatch {
   const hit = matchClause(clause)
   if (!hit) return none
 
+  const suppress = (by: ToneSuppression): TextToneMatch => ({
+    hit: false,
+    pattern: hit.name,
+    excerpt: null,
+    suppressedBy: by,
+  })
+
   const abs = start + hit.index
   const clauseEnd = start + clause.length
   const inQuote = quotedRanges(text).some(([a, b]) => abs >= a && abs < b)
-  if (inQuote) {
-    return { hit: false, pattern: hit.name, excerpt: null, suppressedBy: 'quoted' }
+  if (inQuote) return suppress('quoted')
+
+  if (RHETORICAL_STRONG.test(clause)) return suppress('rhetorical')
+  if (hit.kind === 'ma' && RHETORICAL_SOFT.test(clause)) return suppress('rhetorical')
+
+  const after = clause.slice(hit.index + hit.len)
+  if (REQUEST_AFTER.test(after) || REQUEST_TAIL.test(clause)) return suppress('action-request')
+
+  const before = clause.slice(0, hit.index)
+  if (FIRST_PERSON_EMBEDDED.test(before)) return suppress('embedded-question')
+  if (REPORTED_SPEECH.test(before)) return suppress('reported-speech')
+
+  let prevText = text.slice(0, start).replace(/[，,、；;：:。？?！!\s]+$/, '')
+  if (!prevText) prevText = prevContext.replace(/[，,、；;：:。？?！!\s]+$/, '')
+  if (prevText) {
+    const prevClause = lastClause(prevText).clause
+    if (REPORT_TAIL_THIRD.test(prevClause) || REPORT_TAIL_FIRST.test(prevClause)) {
+      return suppress('reported-speech')
+    }
   }
-  if (REPORTED_SPEECH.test(clause.slice(0, hit.index))) {
-    return { hit: false, pattern: hit.name, excerpt: null, suppressedBy: 'reported-speech' }
-  }
+
   return {
     hit: true,
     pattern: hit.name,

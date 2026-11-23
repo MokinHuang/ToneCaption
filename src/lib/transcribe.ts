@@ -1,6 +1,6 @@
 import type { TranscribeResult } from '../types'
 
-const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/+$/, '')
+const API_BASE = (import.meta.env?.VITE_API_BASE ?? '').replace(/\/+$/, '')
 
 export const EMOTION_LABEL: Record<string, string> = {
   neutral: '中性',
@@ -45,8 +45,8 @@ export async function transcribeFile(
     if (signal?.aborted) throw err
     throw new Error(
       API_BASE
-        ? `无法连接识别服务（${API_BASE}）。请检查网络后重试。`
-        : '无法连接后端服务。请先在 backend 目录启动：uvicorn app:app --host 0.0.0.0 --port 8000',
+        ? `识别服务暂时无法连接（${API_BASE}）。请检查网络后重试。`
+        : '识别服务暂时无法连接，请稍后重试。',
     )
   }
   if (!res.ok) {
@@ -59,15 +59,11 @@ export async function transcribeFile(
     }
     if (detail) throw new Error(detail)
     if (res.status >= 500) {
-      throw new Error(
-        API_BASE
-          ? `识别服务暂时不可用（HTTP ${res.status}），请稍后重试。`
-          : `无法连接后端服务（HTTP ${res.status}，后端可能未启动）。请在 backend 目录运行：uvicorn app:app --host 0.0.0.0 --port 8000`,
-      )
+      throw new Error(`识别服务暂时不可用（HTTP ${res.status}），请稍后重试。`)
     }
     if (res.status === 404 || res.status === 405 || res.status === 501) {
       throw new Error(
-        `当前页面没有识别服务（HTTP ${res.status}）。线上演示站是静态页面，不含后端；识别自己的录音请在本地启动 npm run dev 与 backend 的 uvicorn（端口 8000）。`,
+        `识别服务暂时无法连接（HTTP ${res.status}），请稍后重试；若持续出现请联系站点维护者。`,
       )
     }
     throw new Error(`识别失败（HTTP ${res.status}），请重试或查看后端日志`)
@@ -75,7 +71,7 @@ export async function transcribeFile(
   return (await res.json()) as TranscribeResult
 }
 
-/** 探测本地识别服务是否可用；线上静态站会返回 404/HTML，视为不可用。 */
+/** 探测识别服务是否可用；请求失败或非 ok 状态视为不可用。 */
 export async function checkTranscribeService(): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/api/health`)

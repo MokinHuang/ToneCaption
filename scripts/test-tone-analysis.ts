@@ -99,17 +99,29 @@ test('无措辞 + 平读 → 只留字幕', async () => {
   assert.equal(r.detail.conclusion, 'none')
 })
 
-test('上下文承接：前句提问 + 短句 + 实测上扬 → 语气', async () => {
+test('上下文承接降级：前句提问 + 短句 + 实测上扬 → 最多仅声音线索', async () => {
   const r = await analyzeSegmentTone({
     ...base,
     prevTexts: ['今天讲二叉树。', '大家觉得哪天合适？'],
     text: '这周五交',
     pcm16k: risePcm(),
   })
-  assert.equal(r.tone, TONE_LABEL)
-  assert.ok(r.evidence!.startsWith('承接前句提问「'))
-  assert.ok(r.evidence!.includes('句末音高上扬'))
+  assert.equal(r.tone, undefined)
+  assert.equal(r.toneCue, CUE_LABEL)
+  assert.equal(r.detail.conclusion, 'cue-only')
   assert.equal(r.detail.contextPrevQuestion, '大家觉得哪天合适')
+})
+
+test('上下文承接：「哪天交」接「下周一」带上扬 → 仅声音线索，不猜语气', async () => {
+  const r = await analyzeSegmentTone({
+    ...base,
+    prevTexts: ['哪天交？'],
+    text: '下周一',
+    pcm16k: risePcm(),
+  })
+  assert.equal(r.tone, undefined)
+  assert.equal(r.toneCue, CUE_LABEL)
+  assert.equal(r.detail.conclusion, 'cue-only')
 })
 
 test('上下文承接必须音高确证：平读版落空', async () => {
@@ -134,7 +146,7 @@ test('上下文承接拒绝长陈述句', async () => {
   assert.equal(r.toneCue, CUE_LABEL)
 })
 
-test('15s 强制分段跳过音高（forced-cut），文本规则照跑', async () => {
+test('15s 强制分段：整体暂缓语气判断，末尾未完成小句不提示', async () => {
   const r = await analyzeSegmentTone({
     ...base,
     cutReason: 'max-length',
@@ -144,13 +156,37 @@ test('15s 强制分段跳过音高（forced-cut），文本规则照跑', async 
   assert.equal(r.tone, undefined)
   assert.equal(r.toneCue, undefined)
   assert.equal(r.detail.pitchNullReason, 'forced-cut')
+  // 即使末尾恰好像确认问句，强制切段也不下结论（可能未说完）
   const r2 = await analyzeSegmentTone({
     ...base,
     cutReason: 'max-length',
     text: '大家能接受吗',
     pcm16k: risePcm(),
   })
-  assert.equal(r2.tone, TONE_LABEL)
+  assert.equal(r2.tone, undefined)
+  assert.equal(r2.toneCue, undefined)
+  assert.equal(r2.detail.conclusion, 'none')
+  assert.ok(r2.detail.reason.includes('暂缓'))
+})
+
+test('本轮收紧：反问/动作请求/嵌入式疑问 + 上扬音频 → 只留字幕', async () => {
+  for (const text of ['难道这还不明显吗', '能不能把窗户关一下', '我也不知道这周五能不能交']) {
+    const r = await analyzeSegmentTone({ ...base, text, pcm16k: risePcm() })
+    assert.equal(r.tone, undefined, text)
+    assert.equal(r.toneCue, undefined, text)
+    assert.equal(r.detail.conclusion, 'none', text)
+    assert.ok(r.detail.suppressedBy, text)
+  }
+})
+
+test('本轮收紧：转述前句 + 独立确认后半句 → 语气提示，依据来自后半句', async () => {
+  const r = await analyzeSegmentTone({
+    ...base,
+    text: '老师说周五交，你们能接受吗',
+    pcm16k: null,
+  })
+  assert.equal(r.tone, TONE_LABEL)
+  assert.equal(r.evidence, '说了「你们能接受吗」')
 })
 
 test('空文本 → 只留字幕', async () => {
@@ -182,4 +218,94 @@ test('所有语气输出的证据摘录均为转写原词子串', async () => {
     const m = r.evidence!.match(/说了「(.+?)」/)
     assert.ok(m && text.includes(m[1]), `摘录不在原文: ${r.evidence}`)
   }
+})
+test('同段多句：前句确认提示+原词依据，后句行动要求只字幕', async () => {
+  const r = await analyzeSegmentTone({
+    ...base,
+    text: '大家能接受吗？有冲突的下课来找我。',
+    pcm16k: flatPcm(),
+  })
+  assert.equal(r.sentences.length, 2)
+  const [s1, s2] = r.sentences
+  assert.equal(s1.tone, TONE_LABEL)
+  assert.equal(s1.evidence, '说了「大家能接受吗」')
+  assert.equal(s1.start, 0)
+  assert.equal(s2.tone, undefined)
+  assert.equal(s2.toneCue, undefined)
+  assert.equal(s2.detail.conclusion, 'none')
+  assert.equal(r.tone, TONE_LABEL)
+})
+
+test('同段多句：音高只对齐段末句，不得列为前句依据', async () => {
+  const r = await analyzeSegmentTone({
+    ...base,
+    text: '大家能接受吗？有冲突的下课来找我。',
+    pcm16k: risePcm(),
+  })
+  const [s1, s2] = r.sentences
+  assert.equal(s1.tone, TONE_LABEL)
+  assert.ok(!s1.evidence!.includes('上扬'), '前句依据不得含音高')
+  assert.equal(s1.detail.pitch, null)
+  assert.equal(s1.detail.pitchNullReason, 'not-aligned')
+  // 段末实测上扬对齐到第二句：无确认措辞 → 仅线索
+  assert.equal(s2.toneCue, CUE_LABEL)
+})
+
+test('同段多句：末尾残句暂缓，音高不归属任何句', async () => {
+  const r = await analyzeSegmentTone({
+    ...base,
+    text: '大家能接受吗？有冲突的下课来找我',
+    pcm16k: risePcm(),
+  })
+  const [s1, s2] = r.sentences
+  assert.equal(s1.tone, TONE_LABEL)
+  assert.ok(!s1.evidence!.includes('上扬'))
+  assert.equal(s2.complete, false)
+  assert.equal(s2.tone, undefined)
+  assert.equal(s2.toneCue, undefined)
+  assert.equal(s2.detail.pitchNullReason, 'incomplete-sentence')
+})
+
+test('max-length 多句：完整句凭文本提示，未完成残句暂缓', async () => {
+  const r = await analyzeSegmentTone({
+    ...base,
+    cutReason: 'max-length',
+    text: '大家能接受吗？有冲突的',
+    pcm16k: risePcm(),
+  })
+  const [s1, s2] = r.sentences
+  assert.equal(s1.tone, TONE_LABEL)
+  assert.equal(s1.evidence, '说了「大家能接受吗」')
+  assert.equal(s1.detail.pitchNullReason, 'forced-cut')
+  assert.equal(s2.tone, undefined)
+  assert.ok(s2.detail.reason.includes('未完成句'))
+})
+
+test('请求仍抑制、后排同学求证仍提示', async () => {
+  const req = await analyzeSegmentTone({ ...base, text: '能不能把窗户关一下', pcm16k: null })
+  assert.equal(req.tone, undefined)
+  assert.equal(req.detail.suppressedBy, 'action-request')
+  const back = await analyzeSegmentTone({ ...base, text: '后排同学能不能听到我说话', pcm16k: null })
+  assert.equal(back.tone, TONE_LABEL)
+  assert.equal(back.evidence, '说了「后排同学能不能听到我说话」')
+})
+
+test('转述后跟直接提问：依据只取直接提问', async () => {
+  const one = await analyzeSegmentTone({
+    ...base,
+    text: '他问我能不能补交，你们也想补交吗？',
+    pcm16k: null,
+  })
+  assert.equal(one.tone, TONE_LABEL)
+  assert.equal(one.evidence, '说了「你们也想补交吗」')
+  const two = await analyzeSegmentTone({
+    ...base,
+    text: '他问我能不能补交。你们也想补交吗？',
+    pcm16k: null,
+  })
+  assert.equal(two.sentences.length, 2)
+  assert.equal(two.sentences[0].tone, undefined)
+  assert.equal(two.sentences[0].detail.suppressedBy, 'reported-speech')
+  assert.equal(two.sentences[1].tone, TONE_LABEL)
+  assert.equal(two.sentences[1].evidence, '说了「你们也想补交吗」')
 })

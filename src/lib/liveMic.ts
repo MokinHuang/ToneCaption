@@ -1,5 +1,5 @@
 import type { LiveSegment, MicPhase } from '../types'
-import { transcribeFile } from './transcribe'
+import { transcribeFile } from './transcribe.ts'
 import { analyzeSegmentTone } from './toneAnalysis.ts'
 
 const TARGET_RATE = 16000
@@ -17,6 +17,11 @@ const TONE_DELAY_MS = (() => {
 })()
 
 type CutReason = 'pause' | 'max-length' | 'stop'
+
+/** 去掉空白与标点/符号后为空 → 纯标点识别结果（如 SenseVoice 对短噪声段输出的「。」），不进字幕列表。 */
+export function isPunctuationOnly(text: string): boolean {
+  return text.replace(/[\p{P}\p{S}\s]/gu, '').length === 0
+}
 
 const WORKLET_SOURCE = `
 class MicTap extends AudioWorkletProcessor {
@@ -394,6 +399,16 @@ export class MicLiveSession {
         entry.audioSeconds = item.audioSeconds
         entry.error = err instanceof Error ? err.message : '识别失败，原因未知'
       }
+      // 纯标点结果不进字幕历史、不占当前句、不做语气分析；队列照常继续
+      if (entry.status === 'done' && isPunctuationOnly(entry.text)) {
+        console.info(
+          `[ToneCaption] 过滤纯标点识别结果 seq=${entry.seq} raw=${JSON.stringify(entry.text)}（去空白与标点后为空）`,
+        )
+        this.segments = this.segments.filter((s) => s.seq !== entry.seq)
+        item.pcm16k = null
+        this.emit()
+        continue
+      }
       this.emit()
       if (entry.status === 'done') {
         const pcm = item.pcm16k
@@ -459,6 +474,7 @@ export class MicLiveSession {
       entry.evidence = out.evidence
       entry.toneCue = out.toneCue
       entry.toneDetail = out.detail
+      if (out.sentences.length > 1) entry.toneSentences = out.sentences
       if (out.detail.conclusion !== 'none' && entry.metrics) {
         entry.metrics.toneLatencyMs = performance.now() - responseAt
       }

@@ -8,6 +8,8 @@ export interface CaptionSegment {
   evidence?: string
   /** 只有可靠声学线索、不足以推断语气时显示的短线索（与 tone 互斥） */
   cue?: string
+  /** 同段多句：分句渲染，提示只挂对应句；存在时忽略顶层 tone/cue */
+  parts?: CaptionPart[]
   /** 会话起点后的秒，示例数据用于展示时间标记 */
   start?: number
   /** 实时收音：该段已提交、仍在识别 */
@@ -36,7 +38,7 @@ export interface PitchMeasurement {
 export interface ToneAnalysisDetail {
   textPattern: string | null
   textExcerpt: string | null
-  suppressedBy: 'quoted' | 'reported-speech' | null
+  suppressedBy: 'quoted' | 'reported-speech' | 'embedded-question' | 'rhetorical' | 'action-request' | null
   pitch: PitchMeasurement | null
   pitchNullReason: string | null
   /** SenseVoice 声学情感，仅记录，不参与语气判断 */
@@ -44,6 +46,26 @@ export interface ToneAnalysisDetail {
   contextPrevQuestion: string | null
   conclusion: 'tone' | 'cue-only' | 'none'
   reason: string
+}
+
+/** 段内一句的语气结果：用语段内句子位置（start/end 原文范围）绑定提示。 */
+export interface SentenceTone {
+  text: string
+  start: number
+  end: number
+  complete: boolean
+  tone?: string
+  evidence?: string
+  toneCue?: string
+  detail: ToneAnalysisDetail
+}
+
+/** 字幕分句渲染的一部分（同段多句时提示只挂对应句）。 */
+export interface CaptionPart {
+  text: string
+  tone?: string
+  evidence?: string
+  cue?: string
 }
 
 /** 实时收音的一段字幕（第三阶段 · 本地连续收音）。 */
@@ -58,6 +80,8 @@ export interface LiveSegment {
   evidence?: string
   toneCue?: string
   toneDetail?: ToneAnalysisDetail
+  /** 同段多句时的逐句结果（>1 句才填），提示按句子绑定 */
+  toneSentences?: SentenceTone[]
   metrics?: {
     /** 最后一个有效语音帧 → 判定停顿切段 */
     waitMs: number
