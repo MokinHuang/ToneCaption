@@ -69,6 +69,9 @@ interface QueueItem {
   audioSeconds: number
   lastVoicedAt: number
   cutAt: number
+  /** 识别器字级时间戳（可选）；任一分段缺失则整段不可对齐 */
+  tokens: string[] | null
+  timestamps: [number, number][] | null
 }
 
 interface MicSessionCallbacks {
@@ -359,6 +362,8 @@ export class MicLiveSession {
       audioSeconds: seg.totalMs / 1000,
       lastVoicedAt: seg.lastVoicedAt,
       cutAt,
+      tokens: null,
+      timestamps: null,
     })
     void this.pump()
   }
@@ -387,6 +392,16 @@ export class MicLiveSession {
         entry.status = 'done'
         entry.text = result.segments.map((s) => s.text).join('')
         entry.audioSeconds = item.audioSeconds
+        // 字级时间戳透传：每个分段都有且数量一致才可拼接对齐，否则置空
+        if (
+          result.segments.length > 0 &&
+          result.segments.every(
+            (s) => s.tokens && s.timestamps && s.tokens.length > 0 && s.tokens.length === s.timestamps.length,
+          )
+        ) {
+          item.tokens = result.segments.flatMap((s) => s.tokens!)
+          item.timestamps = result.segments.flatMap((s) => s.timestamps!)
+        }
         entry.metrics = {
           waitMs: item.cutAt - item.lastVoicedAt,
           queueMs: uploadStart - item.cutAt,
@@ -413,7 +428,7 @@ export class MicLiveSession {
       if (entry.status === 'done') {
         const pcm = item.pcm16k
         item.pcm16k = null
-        this.enqueueAnalysis(entry, pcm, emotion, responseAt, item.cutReason)
+        this.enqueueAnalysis(entry, pcm, emotion, responseAt, item.cutReason, item.tokens, item.timestamps)
       } else {
         item.pcm16k = null
       }
@@ -428,9 +443,11 @@ export class MicLiveSession {
     emotion: string | null,
     responseAt: number,
     cutReason: CutReason,
+    tokens: string[] | null = null,
+    timestamps: [number, number][] | null = null,
   ) {
     this.analysisChain = this.analysisChain.then(() =>
-      this.runAnalysis(entry, pcm, emotion, responseAt, cutReason),
+      this.runAnalysis(entry, pcm, emotion, responseAt, cutReason, tokens, timestamps),
     )
   }
 
@@ -453,6 +470,8 @@ export class MicLiveSession {
     emotion: string | null,
     responseAt: number,
     cutReason: CutReason,
+    tokens: string[] | null,
+    timestamps: [number, number][] | null,
   ) {
     try {
       if (this.disposed) return
@@ -468,14 +487,17 @@ export class MicLiveSession {
         pcm16k: pcm,
         cutReason,
         emotion,
+        tokens,
+        timestamps,
       })
       if (this.disposed) return
       entry.tone = out.tone
       entry.evidence = out.evidence
       entry.toneCue = out.toneCue
       entry.toneDetail = out.detail
+      entry.stress = out.stress
       if (out.sentences.length > 1) entry.toneSentences = out.sentences
-      if (out.detail.conclusion !== 'none' && entry.metrics) {
+      if ((out.detail.conclusion !== 'none' || out.stress) && entry.metrics) {
         entry.metrics.toneLatencyMs = performance.now() - responseAt
       }
       this.emit()

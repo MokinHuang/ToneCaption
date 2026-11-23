@@ -5,7 +5,6 @@ import type { ClassroomSession } from '../types'
 export const sampleClassroomSession: ClassroomSession = {
   id: 'class-demo',
   title: '课堂字幕',
-  scene: '语文课 · 作业截止时间',
   currentId: 's03',
   segments: [
     {

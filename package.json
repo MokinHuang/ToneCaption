@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "node --test scripts/test-tone-rules.ts scripts/test-pitch.ts scripts/test-tone-analysis.ts scripts/test-live-binding.ts"
+    "test": "node --test scripts/test-tone-rules.ts scripts/test-pitch.ts scripts/test-tone-analysis.ts scripts/test-live-binding.ts scripts/test-stress.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

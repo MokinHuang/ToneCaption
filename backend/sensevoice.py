@@ -92,6 +92,7 @@ def transcribe(path: str) -> dict:
         batch_size_s=60,
         merge_vad=True,
         merge_length_s=15,
+        output_timestamp=True,
     )
     segments = []
     raw = []
@@ -100,9 +101,22 @@ def transcribe(path: str) -> dict:
         raw.append(rich)
         text, emotion, language, events = parse_rich(rich)
         if text:
-            segments.append(
-                {"text": text, "emotion": emotion, "events": events}
-            )
+            seg = {"text": text, "emotion": emotion, "events": events}
+            # 字级时间戳（CTC 峰值锚点，毫秒，相对整段音频）：识别器支持时可选透传。
+            # words 逐字含标点，"".join(words) 与清洗后文本一致；旧版 funasr 无此输出则省略。
+            words = item.get("words")
+            timestamps = item.get("timestamp")
+            if (
+                isinstance(words, list)
+                and isinstance(timestamps, list)
+                and len(words) == len(timestamps)
+                and len(words) > 0
+            ):
+                seg["tokens"] = words
+                seg["timestamps"] = [
+                    [int(t[0]), int(t[1])] for t in timestamps
+                ]
+            segments.append(seg)
     overall_text = "".join(s["text"] for s in segments)
     overall_emotion = next((s["emotion"] for s in segments if s["emotion"]), None)
     overall_events = []

@@ -14,6 +14,26 @@ function formatStart(start?: number): string | null {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
+/** 重音下划线按字符偏移渲染（绑定原文位置，不做词面匹配，避免同词错位）。 */
+function StressText({
+  text,
+  stress,
+}: {
+  text: string
+  stress?: { start: number; end: number }
+}) {
+  if (!stress || stress.start < 0 || stress.end > text.length || stress.start >= stress.end) {
+    return <>{text}</>
+  }
+  return (
+    <>
+      {text.slice(0, stress.start)}
+      <span className="stress-word">{text.slice(stress.start, stress.end)}</span>
+      {text.slice(stress.end)}
+    </>
+  )
+}
+
 function ToneBlock({ tone, cue, evidence }: { tone?: string; cue?: string; evidence?: string }) {
   if (!tone && !cue) return null
   return (
@@ -71,7 +91,9 @@ export const CaptionList = forwardRef<HTMLOListElement, CaptionListProps>(
               {showParts ? (
                 seg.parts!.map((p, j) => (
                   <div className="caption-part" key={j}>
-                    <p className="caption-text">{p.text}</p>
+                    <p className="caption-text">
+                      {showTone ? <StressText text={p.text} stress={p.stress} /> : p.text}
+                    </p>
                     {showTone && <ToneBlock tone={p.tone} cue={p.cue} evidence={p.evidence} />}
                   </div>
                 ))
@@ -84,7 +106,9 @@ export const CaptionList = forwardRef<HTMLOListElement, CaptionListProps>(
                       ? `识别失败：${seg.error}`
                       : seg.pending
                         ? '识别中…'
-                        : seg.text || '（该段未识别出文字）'}
+                        : showTone
+                          ? <StressText text={seg.text || '（该段未识别出文字）'} stress={seg.stress} />
+                          : seg.text || '（该段未识别出文字）'}
                   </p>
                   {showTone && <ToneBlock tone={seg.tone} cue={seg.cue} evidence={seg.evidence} />}
                 </>

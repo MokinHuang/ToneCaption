@@ -161,7 +161,9 @@ export async function pitchTrack(
     const conf = Math.max(0, Math.min(1, 1 - cmnd[sel]))
     frames.push({
       tMs: ((off + N / 2) / sampleRate) * 1000,
-      f0: f0raw >= C.f0Min && f0raw <= C.f0Max ? f0raw : null,
+      // 低置信度帧（含静音处的 400Hz 兜底值）不携带 f0：
+      // 否则倍频程剔除链会以静音假值为锚，把后续真实语音整段作废
+      f0: f0raw >= C.f0Min && f0raw <= C.f0Max && conf >= C.confTailVoiced ? f0raw : null,
       conf,
       rms,
     })
@@ -207,6 +209,12 @@ export async function pitchTrack(
     if (frames[i].f0 != null) prev = frames[i].f0
   }
   return frames
+}
+
+/** 帧级噪声底（低分位封顶），供句末上扬与重音检测共用同一口径。 */
+export function frameNoiseFloor(frames: PitchFrame[]): number {
+  const rmsAll = frames.map((f) => f.rms)
+  return Math.max(1e-6, Math.min(percentile(rmsAll, 0.1), 0.2 * median(rmsAll)))
 }
 
 /** 从整段粗轨迹找真实语音结束时刻（段末常带静音，尾窗必须锚定语音而非段末）。 */

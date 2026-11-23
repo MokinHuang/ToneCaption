@@ -10,6 +10,7 @@ import type {
 } from '../types'
 import { checkTranscribeService, emotionLabel, eventLabel, transcribeFile } from '../lib/transcribe'
 import { pitchReasonLabel } from '../lib/toneAnalysis.ts'
+import { stressReasonLabel } from '../lib/stress.ts'
 import { MicLiveSession, isPunctuationOnly } from '../lib/liveMic'
 
 interface ClassroomPageProps {
@@ -38,7 +39,8 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
   const [fontIndex, setFontIndex] = useState(DEFAULT_FONT_INDEX)
   const [showTone, setShowTone] = useState(true)
   const [currentVisible, setCurrentVisible] = useState(true)
-  const [view, setView] = useState<'example' | 'recording' | 'live'>('example')
+  const [view, setView] = useState<'recording' | 'live'>('live')
+  const [liveStarted, setLiveStarted] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [rec, setRec] = useState<RecState>({ status: 'idle', result: null, error: null })
   const [service, setService] = useState<'checking' | 'ready' | 'unavailable'>('checking')
@@ -58,6 +60,9 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
             tone: p.tone,
             evidence: p.evidence,
             cue: p.toneCue,
+            stress: p.stress
+              ? { start: p.stress.start - p.start, end: p.stress.end - p.start }
+              : undefined,
           }))
         : undefined
     return {
@@ -68,6 +73,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
       tone: parts ? undefined : s.tone,
       evidence: parts ? undefined : s.evidence,
       cue: parts ? undefined : s.toneCue,
+      stress: parts ? undefined : s.stress ? { start: s.stress.start, end: s.stress.end } : undefined,
       parts,
     }
   })
@@ -76,7 +82,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
   const doneWithMetrics = liveSegs.filter((s) => s.status === 'done' && s.metrics)
   const analyzedSegs = liveSegs.filter((s) => s.toneDetail)
   const activeCurrentId =
-    view === 'example' ? session.currentId : view === 'live' ? liveCurrentId : undefined
+    view === 'live' ? (liveStarted ? liveCurrentId : session.currentId) : undefined
 
   const scrollToCurrent = (smooth: boolean) => {
     if (!activeCurrentId) return
@@ -88,7 +94,8 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
     if (!activeCurrentId) return
     const target = listRef.current?.querySelector(`#caption-${activeCurrentId}`)
     const container = scrollRef.current
-    if (target && container) {
+    const isSamplePreview = view === 'live' && !liveStarted
+    if (!isSamplePreview && target && container) {
       const c = container.getBoundingClientRect()
       const t = target.getBoundingClientRect()
       if (t.bottom > c.bottom || t.top < c.top) {
@@ -103,7 +110,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
     observer.observe(target)
     return () => observer.disconnect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.id, activeCurrentId, view])
+  }, [session.id, activeCurrentId, view, liveStarted])
 
   useEffect(() => () => micRef.current?.dispose(), [])
 
@@ -120,6 +127,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
   const startMic = async () => {
     if (micPhase === 'requesting' || micPhase === 'recording' || micPhase === 'stopping') return
     setView('live')
+    setLiveStarted(true)
     setMicError(null)
     setLiveSegs([])
     micRef.current?.dispose()
@@ -209,11 +217,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
         </div>
         <div className="status-sub">
           <span className="pill pill-preview">
-            {view === 'example'
-              ? '示例预览'
-              : view === 'recording'
-                ? '本次录音识别'
-                : '课堂收音'}
+            {view === 'recording' ? '本次录音识别' : '课堂收音'}
           </span>
           {view === 'live' && micPhase === 'recording' ? (
             <span className="pill pill-live">
@@ -241,19 +245,16 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
               未收音
             </span>
           )}
-          {view === 'example' && (
-            <span className="status-scene">{session.scene}</span>
-          )}
         </div>
         <div className="mode-switch" role="tablist" aria-label="字幕来源">
           <button
             type="button"
             role="tab"
-            aria-selected={view === 'example'}
-            className={view === 'example' ? 'active' : ''}
-            onClick={() => setView('example')}
+            aria-selected={view === 'live'}
+            className={view === 'live' ? 'active' : ''}
+            onClick={() => setView('live')}
           >
-            示例预览
+            课堂收音
           </button>
           <button
             type="button"
@@ -264,15 +265,6 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
           >
             本次录音识别
           </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === 'live'}
-            className={view === 'live' ? 'active' : ''}
-            onClick={() => setView('live')}
-          >
-            课堂收音
-          </button>
         </div>
       </header>
 
@@ -281,25 +273,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
         ref={scrollRef}
         style={{ '--caption-size': `${fontSize}px` } as CSSProperties}
       >
-        {view === 'example' ? (
-          <>
-            <CaptionList
-              ref={listRef}
-              segments={session.segments}
-              currentId={session.currentId}
-              showTone={showTone}
-            />
-            {!currentVisible && (
-              <button
-                type="button"
-                className="jump-current"
-                onClick={() => scrollToCurrent(true)}
-              >
-                ↓ 回到当前句
-              </button>
-            )}
-          </>
-        ) : view === 'live' ? (
+        {view === 'live' ? (
           <>
             <section className="upload-panel" aria-label="课堂麦克风收音">
               <div className="upload-head">
@@ -359,6 +333,23 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
               )}
             </section>
 
+            {!liveStarted && (
+              <section className="rec-result" aria-label="示例字幕预览">
+                <div className="sample-banner" role="note">
+                  <span className="sample-tag">示例预览</span>
+                  <span>
+                    以下为示例字幕，展示语气与依据的样式；点击「开始收音」后清空，只显示真实识别结果。
+                  </span>
+                </div>
+                <CaptionList
+                  ref={listRef}
+                  segments={session.segments}
+                  currentId={session.currentId}
+                  showTone={showTone}
+                />
+              </section>
+            )}
+
             {liveSegs.length > 0 && (
               <section className="rec-result" aria-label="课堂收音字幕">
                 <CaptionList
@@ -417,6 +408,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
                           <th>句</th>
                           <th>文本线索</th>
                           <th>句末音高</th>
+                          <th>重音</th>
                           <th>声学情感</th>
                           <th>结论</th>
                         </tr>
@@ -424,6 +416,7 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
                       <tbody>
                         {analyzedSegs.map((s) => {
                           const d = s.toneDetail!
+                          const stressMark = s.stress ?? s.toneSentences?.find((x) => x.stress)?.stress
                           return (
                             <tr key={s.seq}>
                               <td>{s.seq}</td>
@@ -439,6 +432,11 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
                                   ? `+${d.pitch.riseSemitones}半音 · ${d.pitch.spanMs}ms · 基线${d.pitch.baselineHz}Hz`
                                   : pitchReasonLabel(d.pitchNullReason) || '—'}
                               </td>
+                              <td>
+                                {stressMark
+                                  ? stressMark.evidence
+                                  : stressReasonLabel(d.stressNullReason) || '—'}
+                              </td>
                               <td>{emotionLabel(d.emotion) || '—'}</td>
                               <td>{d.reason}</td>
                             </tr>
@@ -448,13 +446,14 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
                     </table>
                     <p className="aux-note">
                       语气提示由本地可解释规则推断：文本证据摘录转写原词，音高证据来自本段真实音频；SenseVoice
-                      声学情感只作记录。证据不足或属引用/转述时只保留字幕。
+                      声学情感只作记录。证据不足或属引用/转述时只保留字幕。重音下划线只标记实测更响的短词
+                      （相对响度为主，音高/拉长仅作加强），依据只写真正测到的证据；无字级时间戳或证据不足时不标记。
                     </p>
                   </details>
                 )}
               </section>
             )}
-            {!currentVisible && liveCurrentId && (
+            {!currentVisible && activeCurrentId && (
               <button
                 type="button"
                 className="jump-current"
@@ -635,10 +634,10 @@ export function ClassroomPage({ session, onBackHome }: ClassroomPageProps) {
         </button>
         <p className="action-note">
           {view === 'live'
-            ? '真实识别结果 · 语气提示为本地规则推断 · 音频仅发送到识别服务 · 停止即释放麦克风'
-            : view === 'recording'
-              ? '上传 WAV 由 SenseVoiceSmall 识别，失败给出具体原因'
-              : '示例数据 · 不采集声音'}
+            ? liveStarted
+              ? '真实识别结果 · 语气提示为本地规则推断 · 音频仅发送到识别服务 · 停止即释放麦克风'
+              : '当前为示例字幕 · 点「开始收音」清空示例并开始真实识别 · 停止即释放麦克风'
+            : '上传 WAV 由 SenseVoiceSmall 识别，失败给出具体原因'}
         </p>
       </footer>
     </div>

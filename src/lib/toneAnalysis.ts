@@ -1,11 +1,12 @@
 /** 语气融合：文本规则 + 句末音高 + 少量上文 → 三态输出（语气 / 仅线索 / 只留字幕）。
  *  整体 try/catch，任何异常都降级为"只留字幕"，绝不影响收音与转写。
  *  SenseVoice 声学情感仅作记录，不参与判断；说话人不明，不做跨句音量/语速比较。 */
-import type { SentenceTone, ToneAnalysisDetail } from '../types.ts'
+import type { SentenceTone, StressMark, ToneAnalysisDetail } from '../types.ts'
 import { matchTextTone, findPrevQuestion, splitSentences } from './toneRules.ts'
 import type { ToneSuppression, TextToneMatch } from './toneRules.ts'
-import { pitchTrack, tailRise, voicedEndMs, PITCH_CONST } from './pitch.ts'
-import type { TailRiseResult } from './pitch.ts'
+import { pitchTrack, tailRise, voicedEndMs, frameNoiseFloor, PITCH_CONST } from './pitch.ts'
+import type { PitchFrame, TailRiseResult } from './pitch.ts'
+import { alignTokens, detectSentenceStress } from './stress.ts'
 
 export const TONE_LABEL = '可能在征求确认'
 export const CUE_LABEL = '句末音高上扬'
@@ -19,6 +20,9 @@ export interface ToneAnalysisInput {
   pcm16k: Float32Array | null
   cutReason: 'pause' | 'max-length' | 'stop'
   emotion: string | null
+  /** 识别器字级 token 与毫秒时间戳（可选）；缺失时不做重音，绝不按字数均分 */
+  tokens?: string[] | null
+  timestamps?: [number, number][] | null
 }
 
 export interface ToneAnalysisOutput {
@@ -28,6 +32,8 @@ export interface ToneAnalysisOutput {
   detail: ToneAnalysisDetail
   /** 段内逐句结果（含单句段）；多句时提示按句子位置/原文范围绑定 */
   sentences: SentenceTone[]
+  /** 第一个给出重音标记的句子（供单句段渲染与指标） */
+  stress?: StressMark
 }
 
 const PITCH_REASON_ZH: Record<string, string> = {
@@ -65,14 +71,17 @@ const SUPPRESS_REASON: Record<ToneSuppression, string> = {
   'action-request': '动作请求（把/帮/一下类），不是征求确认',
 }
 
-async function measurePitch(pcm: Float32Array | null): Promise<TailRiseResult> {
+async function measurePitch(
+  pcm: Float32Array | null,
+  preBody: PitchFrame[] | null,
+  t0: number,
+): Promise<TailRiseResult> {
   if (!pcm || pcm.length === 0) return { ok: false, reason: 'no-audio' }
   const sr = 16000
   const totalMs = (pcm.length / sr) * 1000
   if (totalMs < MIN_PITCH_SEGMENT_MS) return { ok: false, reason: 'too-short-segment' }
-  const t0 = performance.now()
   // 先整段粗轨迹：段末常带静音，细尾窗必须锚定真实语音结束点而非段末
-  const body = await pitchTrack(pcm, sr, { hopMs: PITCH_CONST.bodyHopMs })
+  const body = preBody ?? (await pitchTrack(pcm, sr, { hopMs: PITCH_CONST.bodyHopMs }))
   if (performance.now() - t0 > ANALYSIS_BUDGET_MS) {
     return { ok: false, reason: 'budget-exceeded' }
   }
@@ -126,6 +135,8 @@ export async function analyzeSegmentTone(input: ToneAnalysisInput): Promise<Tone
     contextPrevQuestion: null,
     conclusion: 'none',
     reason: '',
+    stress: null,
+    stressNullReason: null,
   })
   try {
     const text = input.text ?? ''
@@ -147,16 +158,35 @@ export async function analyzeSegmentTone(input: ToneAnalysisInput): Promise<Tone
       detail.textExcerpt = tr.excerpt
       detail.suppressedBy = tr.suppressedBy
       detail.pitchNullReason = 'forced-cut'
+      detail.stressNullReason = 'forced-cut'
       detail.reason = '超长强制分段，末尾小句可能未说完，暂缓语气判断'
       return { detail, sentences: [{ ...spans[0], detail }] }
     }
+
+    // 字级对齐：识别器时间戳逐字精确匹配；缺失或不可靠 → 不做重音，不猜位置
+    const anchors =
+      input.tokens && input.timestamps && input.tokens.length > 0
+        ? alignTokens(text, input.tokens, input.timestamps)
+        : null
 
     // 音高整段测一次，只能对齐到"段末完整句"：自然切段且末尾无未完成残句。
     // 多句段的前句无法从句级时间戳对齐音高，一律不列为其依据。
     const last = spans[spans.length - 1]
     const pitchEligible = !forced && (!multi || last.complete)
-    const pr = pitchEligible ? await measurePitch(input.pcm16k) : null
+    const stressEligible = !forced && anchors != null && spans.some((s) => s.complete)
+    const pcm = input.pcm16k
+    const totalMs = pcm ? (pcm.length / 16000) * 1000 : 0
+    const t0 = performance.now()
+    // 粗轨迹整段只算一次，句末上扬与重音共用（重音不额外增加 DSP 开销）
+    let body: PitchFrame[] | null = null
+    if (pcm && pcm.length > 0 && totalMs >= MIN_PITCH_SEGMENT_MS && (pitchEligible || stressEligible)) {
+      body = await pitchTrack(pcm, 16000, { hopMs: PITCH_CONST.bodyHopMs })
+    }
+    const budgetHit = performance.now() - t0 > ANALYSIS_BUDGET_MS
+    const pr = pitchEligible ? await measurePitch(pcm, body, t0) : null
     const ctx = findPrevQuestion(input.prevTexts)
+    const noiseFloor = body ? frameNoiseFloor(body) : 0
+    const speechEnd = body ? voicedEndMs(body) : null
 
     const sentences: SentenceTone[] = []
     for (let i = 0; i < spans.length; i++) {
@@ -166,6 +196,7 @@ export async function analyzeSegmentTone(input: ToneAnalysisInput): Promise<Tone
       // 多句段的末尾残句（含强制切段后的未完成句）：先显示字幕，暂缓判断
       if (multi && !sp.complete) {
         detail.pitchNullReason = forced ? 'forced-cut' : 'incomplete-sentence'
+        detail.stressNullReason = forced ? 'forced-cut' : 'incomplete-sentence'
         detail.reason = forced
           ? '强制切段后的未完成句，暂缓语气判断'
           : '句尾边界不完整，暂缓语气判断'
@@ -183,20 +214,50 @@ export async function analyzeSegmentTone(input: ToneAnalysisInput): Promise<Tone
       } else {
         detail.pitchNullReason = forced ? 'forced-cut' : 'not-aligned'
       }
-      sentences.push({ ...sp, ...conclude(tr, attributed, detail), detail })
+      // 重音：完整句 + 字级对齐 + 粗轨迹可用；与语气结论独立，证据不足留空
+      let stressMark: StressMark | undefined
+      if (forced) {
+        detail.stressNullReason = 'forced-cut'
+      } else if (!anchors) {
+        detail.stressNullReason = 'no-alignment'
+      } else if (!pcm || pcm.length === 0) {
+        detail.stressNullReason = 'no-audio'
+      } else if (budgetHit) {
+        detail.stressNullReason = 'budget-exceeded'
+      } else if (!body) {
+        detail.stressNullReason = 'no-speech'
+      } else {
+        const sr = detectSentenceStress({
+          text,
+          start: sp.start,
+          end: sp.end,
+          anchors,
+          frames: body,
+          hopMs: PITCH_CONST.bodyHopMs,
+          noiseFloor,
+          speechEndMs: speechEnd,
+        })
+        detail.stress = sr.measurement
+        detail.stressNullReason = sr.reason
+        stressMark = sr.mark ?? undefined
+      }
+      sentences.push({ ...sp, ...conclude(tr, attributed, detail), stress: stressMark, detail })
     }
     const winner = sentences.find((s) => s.tone) ?? sentences.find((s) => s.toneCue)
+    const stressWinner = sentences.find((s) => s.stress)
     return {
       tone: winner?.tone,
       evidence: winner?.evidence,
       toneCue: winner?.toneCue,
       detail: winner?.detail ?? sentences[sentences.length - 1].detail,
       sentences,
+      stress: stressWinner?.stress,
     }
   } catch (err) {
     const detail = baseDetail()
     detail.conclusion = 'none'
     detail.pitchNullReason = 'analysis-error'
+    detail.stressNullReason = 'analysis-error'
     detail.reason = `分析异常：${err instanceof Error ? err.message : String(err)}`
     return { detail, sentences: [] }
   }

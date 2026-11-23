@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { TONE_LABEL } from '../src/lib/toneAnalysis.ts'
 import type { LiveSegment } from '../src/types.ts'
+import { synthAudio, wuZiJiaoChuGao } from './synth-stress-audio.ts'
 
 /** 语气分析串行链与转写解耦：第一条语气晚到时，第二条字幕不受阻，
  *  迟到结果只回填对应原句（entry 引用绑定），不挂到后续句子。
@@ -58,6 +59,53 @@ test('语气晚到：第二句字幕按时显示，提示只补回原句', async
     const last = snapshots[snapshots.length - 1]
     assert.equal(last.find((x) => x.seq === 1)?.tone, TONE_LABEL)
     assert.equal(last.find((x) => x.seq === 2)?.tone, undefined)
+    s.dispose()
+  } finally {
+    delete (globalThis as unknown as Record<string, unknown>).window
+  }
+})
+test('重音晚到：只补回原句原文位置，不挂后续句、不落到同句另一个相同词', async () => {
+  ;(globalThis as unknown as Record<string, unknown>).window = {
+    location: { search: '?tone_delay=250' },
+  }
+  try {
+    const { MicLiveSession } = await import('../src/lib/liveMic.ts')
+    const s = new MicLiveSession({ onSegments: () => {}, onPhase: () => {} })
+    // 第一句含重复词「周五」，重读第二个「周五」；第二句无音频
+    const chars = [
+      ...wuZiJiaoChuGao(),
+      { ch: '，', gapAfterMs: 250 },
+      { ch: '周', amp: 0.2 }, { ch: '五', amp: 0.2 }, { ch: '交' }, { ch: '终' }, { ch: '稿' },
+      { ch: '。', gapAfterMs: 200 },
+    ]
+    const a = synthAudio(chars)
+    const e1: LiveSegment = { seq: 1, status: 'done', text: a.text, audioSeconds: 2 }
+    const e2: LiveSegment = { seq: 2, status: 'done', text: '这周五交', audioSeconds: 1 }
+    const internal = s as unknown as {
+      segments: LiveSegment[]
+      analysisChain: Promise<void>
+      enqueueAnalysis: (
+        e: LiveSegment,
+        pcm: Float32Array | null,
+        emotion: string | null,
+        at: number,
+        cut: 'pause',
+        tokens?: string[] | null,
+        timestamps?: [number, number][] | null,
+      ) => void
+    }
+    internal.segments.push(e1, e2)
+    const t0 = performance.now()
+    internal.enqueueAnalysis(e1, a.pcm, 'neutral', t0, 'pause', a.tokens, a.timestamps)
+    internal.enqueueAnalysis(e2, null, 'neutral', t0, 'pause')
+
+    await new Promise((r) => setTimeout(r, 60))
+    assert.equal(e1.stress, undefined, '延迟窗口内重音不应到达')
+    await internal.analysisChain
+    assert.ok(e1.stress, '迟到重音应补回原句')
+    assert.equal(e1.stress!.word, '周五')
+    assert.equal(e1.stress!.start, 6, '绑定第二个「周五」的字符位置')
+    assert.equal(e2.stress, undefined, '不得挂到第二句')
     s.dispose()
   } finally {
     delete (globalThis as unknown as Record<string, unknown>).window

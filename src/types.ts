@@ -10,6 +10,8 @@ export interface CaptionSegment {
   cue?: string
   /** 同段多句：分句渲染，提示只挂对应句；存在时忽略顶层 tone/cue */
   parts?: CaptionPart[]
+  /** 单句段的重音下划线范围（相对 text 的字符偏移） */
+  stress?: { start: number; end: number }
   /** 会话起点后的秒，示例数据用于展示时间标记 */
   start?: number
   /** 实时收音：该段已提交、仍在识别 */
@@ -46,6 +48,9 @@ export interface ToneAnalysisDetail {
   contextPrevQuestion: string | null
   conclusion: 'tone' | 'cue-only' | 'none'
   reason: string
+  /** 重音实测值与留空原因（与语气结论独立） */
+  stress: StressMeasurement | null
+  stressNullReason: string | null
 }
 
 /** 段内一句的语气结果：用语段内句子位置（start/end 原文范围）绑定提示。 */
@@ -57,7 +62,30 @@ export interface SentenceTone {
   tone?: string
   evidence?: string
   toneCue?: string
+  /** 句内重音标记（start/end 为整段文本偏移，绑定原文位置而非词面匹配） */
+  stress?: StressMark
   detail: ToneAnalysisDetail
+}
+
+/** 重音标记：目标词在整段文本中的字符范围 + 一句话实测依据。 */
+export interface StressMark {
+  word: string
+  start: number
+  end: number
+  evidence: string
+}
+
+/** 重音实测值（只记录真正测到并参与判断的证据）。 */
+export interface StressMeasurement {
+  /** 目标词相对句内其余语音的响度差（dB） */
+  loudnessDb: number
+  /** 音高差（半音），未达加强门槛或未测到时为 null */
+  pitchSt: number | null
+  /** 平均每字时长比，未达加强门槛或未测到时为 null */
+  durationRatio: number | null
+  wordActiveMs: number
+  restActiveMs: number
+  cues: ('loudness' | 'pitch' | 'duration')[]
 }
 
 /** 字幕分句渲染的一部分（同段多句时提示只挂对应句）。 */
@@ -66,6 +94,8 @@ export interface CaptionPart {
   tone?: string
   evidence?: string
   cue?: string
+  /** 重音下划线范围（相对本 part 文本的字符偏移） */
+  stress?: { start: number; end: number }
 }
 
 /** 实时收音的一段字幕（第三阶段 · 本地连续收音）。 */
@@ -82,6 +112,8 @@ export interface LiveSegment {
   toneDetail?: ToneAnalysisDetail
   /** 同段多句时的逐句结果（>1 句才填），提示按句子绑定 */
   toneSentences?: SentenceTone[]
+  /** 单句段的重音标记（异步补充；多句段在 toneSentences 内逐句绑定） */
+  stress?: StressMark
   metrics?: {
     /** 最后一个有效语音帧 → 判定停顿切段 */
     waitMs: number
@@ -107,7 +139,6 @@ export type MicPhase =
 export interface ClassroomSession {
   id: string
   title: string
-  scene: string
   segments: CaptionSegment[]
   currentId: string
 }
@@ -117,6 +148,10 @@ export interface TranscribeSegment {
   text: string
   emotion: string | null
   events: string[]
+  /** 字级 token（逐字含标点，拼接与 text 一致）；识别器支持时可选返回 */
+  tokens?: string[]
+  /** 与 tokens 一一对应的 [起始,结束] 毫秒（CTC 峰值锚点，相对整段音频） */
+  timestamps?: [number, number][]
 }
 
 export interface TranscribeResult {
