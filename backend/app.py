@@ -28,8 +28,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ToneCaption Transcribe", lifespan=lifespan)
 
+# 公网来源只放行 TONECAPTION_ALLOWED_ORIGINS 中明确列出的站点（逗号分隔，含协议与端口）
+_extra_origins = [
+    o.strip()
+    for o in os.environ.get("TONECAPTION_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=_extra_origins,
     allow_origin_regex=r"http://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?",
     allow_methods=["*"],
     allow_headers=["*"],
